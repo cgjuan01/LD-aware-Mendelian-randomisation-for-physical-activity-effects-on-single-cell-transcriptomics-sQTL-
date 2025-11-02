@@ -1,0 +1,219 @@
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(TwoSampleMR)
+  library(ieugwasr)
+  library(MendelianRandomization)
+})
+
+get_ogw_token <- function() {
+  t <- Sys.getenv("OPENGWAS_JWT", unset = "")
+  if (!nzchar(t)) t <- Sys.getenv("IEU_TOKEN", unset = "")
+  if (nzchar(t)) {
+    Sys.setenv(OPENGWAS_JWT = t)
+    if ("ieugwasr" %in% .packages(all.available = TRUE)) {
+      if ("set_opengwas_jwt" %in% getNamespaceExports("ieugwasr")) {
+        try(ieugwasr::set_opengwas_jwt(t), silent = TRUE)
+      }
+    }
+  }
+  t
+}
+.OPENGWAS_TOKEN <- get_ogw_token()
+
+EXPOSURE_CSV <- "/Users/ciara/Downloads/fine-mapped-pa-snps.csv"
+ONEK1K_DIR   <- "~/Downloads/OneK1K"
+ONEK1K_FILES <- c("QTD000606.all.tsv","QTD000607.all.tsv","QTD000608.all.tsv",
+                  "QTD000609.all.tsv","QTD000610.all.tsv","QTD000611.all.tsv")
+CELL_LABELS <- c(QTD000606="CD4_Tcell_unstim",QTD000607="CD8_Tcell_unstim",
+                 QTD000608="Bcell_unstim",QTD000609="Monocyte_unstim",
+                 QTD000610="NKcell_unstim",QTD000611="Dendritic_unstim")
+
+N_EXPOSURE <- NA_integer_
+N_OUTCOME_BY_CELL <- c(CD4_Tcell_unstim=NA_integer_,CD8_Tcell_unstim=NA_integer_,
+                       Bcell_unstim=NA_integer_,Monocyte_unstim=NA_integer_,
+                       NKcell_unstim=NA_integer_,Dendritic_unstim=NA_integer_)
+
+LD_POP <- "EUR"
+OUTDIR <- "~/Downloads/mr_ld_pa_scqtl_addon"
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+COLOC_DIR <- file.path(OUTDIR, "coloc_ready"); dir.create(COLOC_DIR, recursive = TRUE, showWarnings = FALSE)
+
+std_rsid <- function(x){ x <- trimws(as.character(x)); x <- gsub("\\s+","",x); x <- sub("^\\.*","",x); x <- sub("^rs","",x,ignore.case=TRUE); paste0("rs",x) }
+
+norm_cols_outcome <- function(dt){
+  setnames(dt, tolower(names(dt)))
+  rn_old <- c("rsid","alt","ref","beta","se","pvalue","gene_id","molecular_trait_id","molecular_trait_object_id","cell_type","chromosome","position")
+  rn_new <- c("snp","effect_allele","other_allele","beta","se","pval","gene_id","gene_id","gene_id","cell_type","chr","pos")
+  for(i in seq_along(rn_old)) if (rn_old[i] %in% names(dt)) setnames(dt, rn_old[i], rn_new[i], skip_absent=TRUE)
+  if (!"snp" %in% names(dt)) stop("Outcome lacks rsIDs.")
+  dt[, snp := std_rsid(snp)]
+  if ("effect_allele" %in% names(dt)) dt[, effect_allele := toupper(effect_allele)]
+  if ("other_allele"  %in% names(dt)) dt[,  other_allele := toupper(other_allele)]
+  dt <- dt[, !duplicated(names(dt)), with=FALSE]
+  dt
+}
+
+read_exposure <- function(path){
+  if (!file.exists(path)) stop("Exposure file not found: ", path)
+  dt <- data.table::fread(path); setnames(dt, tolower(names(dt)))
+  if (!"snp"%in%names(dt)){ cand <- intersect(c("rsid","snp","id","variant","rs_id"), names(dt)); if(length(cand)) setnames(dt, cand[1], "snp")}
+  if (!"effect_allele"%in%names(dt)){ cand <- intersect(c("ea","effect","a1","allele1"),names(dt)); if(length(cand)) setnames(dt,cand[1],"effect_allele")}
+  if (!"other_allele"%in%names(dt)){ cand <- intersect(c("oa","other","a2","allele2"),names(dt)); if(length(cand)) setnames(dt,cand[1],"other_allele")}
+  if (!"beta"%in%names(dt)){ cand <- intersect(c("b","beta_pa","effect","beta_exposure"),names(dt)); if(length(cand)) setnames(dt,cand[1],"beta")}
+  if (!"se"%in%names(dt)){ cand <- intersect(c("se_pa","sebeta","se_exposure","stderr"),names(dt)); if(length(cand)) setnames(dt,cand[1],"se")}
+  if (!"eaf"%in%names(dt)){ cand <- intersect(c("eaf_exposure","eafreq","af","maf","eaf_a1"),names(dt)); if(length(cand)) setnames(dt,cand[1],"eaf") else dt[,eaf:=NA_real_]}
+  if (!"pval"%in%names(dt)){ if(all(c("beta","se")%in%names(dt))){ z <- as.numeric(dt$beta)/as.numeric(dt$se); dt[,pval:=2*pnorm(-abs(z))] } else dt[,pval:=NA_real_] }
+  dt[, snp := std_rsid(snp)]
+  as.data.frame(transmute(dt,
+    SNP=snp, beta.exposure=as.numeric(beta), se.exposure=as.numeric(se),
+    eaf.exposure=as.numeric(eaf), pval.exposure=as.numeric(pval),
+    effect_allele.exposure=toupper(effect_allele), other_allele.exposure=toupper(other_allele),
+    id.exposure="PA_finemap", exposure="Vigorous PA (fine-mapped)"))
+}
+
+format_exposure_for_TSMR <- function(exp_dt){
+  exp_df <- as.data.frame(exp_dt %>% rename(beta=beta.exposure,se=se.exposure,eaf=eaf.exposure,pval=pval.exposure,
+                                            effect_allele=effect_allele.exposure,other_allele=other_allele.exposure))
+  TwoSampleMR::format_data(exp_df, type="exposure",
+    snp_col="SNP", beta_col="beta", se_col="se",
+    effect_allele_col="effect_allele", other_allele_col="other_allele",
+    eaf_col="eaf", pval_col="pval")
+}
+
+ld_api_matrix <- function(snps, pop="EUR"){
+  snps <- unique(snps)
+  ogw <- try(ieugwasr::ld_matrix(variants=snps, with_alleles=FALSE, pop=pop), silent=TRUE)
+  if (!inherits(ogw,"try-error")) return(as.matrix(ogw))
+  if (nzchar(Sys.getenv("LD_ACCESS_TOKEN","")) && requireNamespace("LDlinkR", quietly=TRUE)){
+    message("Falling back to LDlinkR LDmatrix() …")
+    idx <- split(seq_along(snps), ceiling(seq_along(snps)/300))
+    mats <- lapply(idx, function(ix) LDlinkR::LDmatrix(snps=snps[ix], pop="EUR", r2d="r2", file=FALSE))
+    dims <- vapply(mats, nrow, 1L); M <- matrix(0, sum(dims), sum(dims)); r<-1; c<-1
+    for (m in mats){ d<-nrow(m); M[r:(r+d-1), c:(c+d-1)] <- as.matrix(m); r<-r+d; c<-c+d }
+    rownames(M) <- colnames(M) <- unlist(lapply(mats, rownames))
+    keep <- intersect(snps, rownames(M)); return(M[keep, keep, drop=FALSE])
+  }
+  warning("⚠️ Using identity LD (independence assumed)."); I <- diag(length(snps)); rownames(I)<-colnames(I)<-snps; I
+}
+
+make_pd <- function(M){ e<-eigen(M, symmetric=TRUE); if(min(e$values)>1e-8) return(M); M + diag(abs(min(e$values))+1e-6, nrow(M)) }
+
+run_ld_mr <- function(hdat, LD){
+  ord <- match(hdat$SNP, rownames(LD)); LD <- LD[ord, ord, drop=FALSE]
+  bx<-hdat$beta.exposure; bxse<-hdat$se.exposure; by<-hdat$beta.outcome; byse<-hdat$se.outcome
+  inp <- MendelianRandomization::mr_input(bx=bx,bxse=bxse,by=by,byse=byse,correlation=LD)
+  ivw <- MendelianRandomization::mr_ivw(inp); egger <- MendelianRandomization::mr_egger(inp)
+  list(ivw=ivw, egger=egger)
+}
+
+message("Reading exposure from: ", EXPOSURE_CSV)
+exp_dt  <- read_exposure(EXPOSURE_CSV)
+exp_fmt <- format_exposure_for_TSMR(exp_dt)
+Q_ROWS <- list()
+
+for (f in ONEK1K_FILES){
+  qtid  <- sub("\\.all\\.tsv$","",basename(f))
+  label <- CELL_LABELS[[qtid]]; if(is.null(label)) label <- qtid
+  infile <- file.path(ONEK1K_DIR, f); if(!file.exists(infile)){ warning("Missing file: ", infile); next }
+
+  message("\n=== Outcome: ", label, " ===")
+  out_raw <- data.table::fread(infile, nThread=4, showProgress=TRUE)
+  out_dt  <- norm_cols_outcome(out_raw)
+  keep_cols <- intersect(c("snp","effect_allele","other_allele","beta","se","pval","gene_id","cell_type","chr","pos"), names(out_dt))
+  out_dt <- out_dt[, ..keep_cols]; out_dt <- out_dt[, !duplicated(names(out_dt)), with=FALSE]
+
+  ov <- intersect(exp_dt$SNP, out_dt$snp); if (length(ov)==0) next
+  out_dt <- out_dt[snp %in% ov]; if (!"gene_id"%in%names(out_dt)){ warning("Outcome lacks gene_id; skipping ", label); next }
+  genes <- unique(out_dt$gene_id)
+
+  for (g in genes){
+    gdt <- out_dt[gene_id==g]
+    if ("pval" %in% names(gdt)){ setorder(gdt, snp, pval); gdt <- unique(gdt, by="snp") } else gdt <- unique(gdt, by="snp")
+
+    oc <- intersect(c("snp","effect_allele","other_allele","beta","se"), names(gdt))
+    out_df <- as.data.frame(gdt[, ..oc]); colnames(out_df) <- oc
+
+    out_fmt <- TwoSampleMR::format_data(out_df, type="outcome",
+      snp_col="snp", beta_col="beta", se_col="se",
+      effect_allele_col="effect_allele", other_allele_col="other_allele")
+    out_fmt$id.outcome <- paste0(label,"|",g); out_fmt$outcome <- paste0(label,"|",g)
+
+    hdat <- harmonise_data(exp_fmt, out_fmt, action=1) %>%
+      dplyr::filter(!is.na(beta.exposure), !is.na(beta.outcome), !is.na(se.exposure), !is.na(se.outcome))
+    if (nrow(hdat) < 1) next
+
+    steiger_dir <- NA_character_; steiger_p <- NA_real_
+    if (!is.na(N_EXPOSURE) && !is.na(N_OUTCOME_BY_CELL[[label]])){
+      hd <- hdat; hd$samplesize.exposure <- N_EXPOSURE; hd$samplesize.outcome <- N_OUTCOME_BY_CELL[[label]]
+      st <- try(TwoSampleMR::steiger(hd), silent=TRUE)
+      if (!inherits(st,"try-error")){
+        steiger_dir <- ifelse(all(st$correct_causal_direction, na.rm=TRUE), "exposure->outcome", "not_exposure->outcome")
+        steiger_p <- suppressWarnings(min(st$steiger_pval, na.rm=TRUE)); if(!is.finite(steiger_p)) steiger_p <- NA_real_
+      }
+    }
+
+    if (nrow(hdat)==1){
+      bx<-hdat$beta.exposure; by<-hdat$beta.outcome; bxse<-hdat$se.exposure; byse<-hdat$se.outcome
+      beta_WR<-by/bx; se_WR<-sqrt((byse^2/bx^2)+((by^2*bxse^2)/bx^4)); p_WR<-2*pnorm(-abs(beta_WR/se_WR))
+      Q_ROWS[[length(Q_ROWS)+1]] <- data.frame(cell=label,gene=g,method="Wald ratio",nsnp=1,
+        beta=beta_WR,se=se_WR,pval=p_WR,Q=NA,Q_df=NA,Q_p=NA,steiger_dir=steiger_dir,steiger_p=steiger_p,stringsAsFactors=FALSE)
+    } else {
+      LD <- ld_api_matrix(hdat$SNP, pop=LD_POP); LD <- make_pd(LD); fit <- run_ld_mr(hdat, LD)
+      Qvec <- try(fit$ivw@Heter.Stat, silent=TRUE); Q<-Q_df<-Q_p<-NA_real_
+      if (!inherits(Qvec,"try-error") && length(Qvec)>=2){ Q<-as.numeric(Qvec[1]); Q_df<-as.numeric(ifelse(length(Qvec)>=2,Qvec[2],nrow(hdat)-1)); Q_p<-tryCatch(pchisq(Q, df=Q_df, lower.tail=FALSE), error=function(e) NA_real_) }
+
+      Q_ROWS[[length(Q_ROWS)+1]] <- data.frame(cell=label,gene=g,method="LD-IVW",nsnp=nrow(hdat),
+        beta=fit$ivw@Estimate,se=fit$ivw@StdError,pval=fit$ivw@Pvalue,Q=Q,Q_df=Q_df,Q_p=Q_p,steiger_dir=steiger_dir,steiger_p=steiger_p,stringsAsFactors=FALSE)
+
+      eg_est <- tryCatch(fit$egger@Estimate, error=function(e) NA_real_)
+      eg_se  <- tryCatch(fit$egger@StdError.Est, error=function(e) NA_real_)
+      eg_p   <- tryCatch(fit$egger@Pvalue.Est, error=function(e) NA_real_)
+      eg_i   <- tryCatch(fit$egger@Intercept, error=function(e) NA_real_)
+      eg_iSE <- tryCatch(fit$egger@StdError.Int, error=function(e) NA_real_)
+      eg_iP  <- tryCatch(fit$egger@Pvalue.Int, error=function(e) NA_real_)
+      Q_ROWS[[length(Q_ROWS)+1]] <- data.frame(cell=label,gene=g,method="LD-Egger",nsnp=nrow(hdat),
+        beta=eg_est,se=eg_se,pval=eg_p,Q=NA,Q_df=NA,Q_p=NA,steiger_dir=steiger_dir,steiger_p=steiger_p,
+        egger_intercept=eg_i, egger_intercept_se=eg_iSE, egger_intercept_p=eg_iP, stringsAsFactors=FALSE)
+    }
+
+    # ---------- COLOC-READY EXPORT (FIXED JOIN KEYS) ----------
+    coloc_snps <- unique(hdat$SNP)
+
+    exp_sub <- exp_dt %>%
+      transmute(snp = SNP,
+                ea_exp = effect_allele.exposure, oa_exp = other_allele.exposure,
+                beta_exp = beta.exposure, se_exp = se.exposure,
+                eaf_exp = eaf.exposure, pval_exp = pval.exposure) %>%
+      filter(snp %in% coloc_snps)
+
+    out_mat <- gdt %>%
+      transmute(snp = snp,
+                chr = if ("chr" %in% names(gdt)) chr else NA_integer_,
+                pos = if ("pos" %in% names(gdt)) pos else NA_integer_,
+                ea_out = effect_allele, oa_out = other_allele,
+                beta_out = beta, se_out = se,
+                pval_out = if ("pval" %in% names(gdt)) pval else NA_real_) %>%
+      filter(snp %in% coloc_snps)
+
+    # safe join (both have 'snp')
+    coloc_tab <- exp_sub %>% left_join(out_mat, by = "snp")
+    coloc_tab$N_exp <- N_EXPOSURE
+    coloc_tab$N_out <- N_OUTCOME_BY_CELL[[label]]
+
+    fn <- file.path(COLOC_DIR, paste0("coloc_", gsub("\\W+","_",label), "_", gsub("\\W+","_",g), ".csv"))
+    data.table::fwrite(coloc_tab, fn)
+  }
+}
+
+if (length(Q_ROWS)){
+  QSUM <- dplyr::bind_rows(Q_ROWS) %>%
+    group_by(cell, method) %>% mutate(p_fdr = p.adjust(pval, method="BH")) %>% ungroup()
+  data.table::fwrite(QSUM, file.path(OUTDIR, "mr_q_steiger_summary.csv"))
+  message("\nDone → ", file.path(OUTDIR, "mr_q_steiger_summary.csv"))
+  message("Coloc-ready tables in: ", COLOC_DIR)
+} else {
+  message("\nNo results produced.")
+}
